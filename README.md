@@ -8,7 +8,7 @@ Special abilities for our Haxball futsal room! Pick a character, use abilities w
 
 ### Firefox (recommended)
 
-1. Click this link: **[Download for Firefox](https://addons.mozilla.org/firefox/downloads/file/4858302/3bc1525dc71b41c0885d-2.0.xpi)**
+1. Click this link: **[Download for Firefox](https://addons.mozilla.org/firefox/downloads/file/4858896/shashuke_haxball_abilities-2.1.xpi)**
 2. Firefox will ask "Add Haxball Abilities?" → Click **Add**
 3. ✅ That's it! You're ready to play
 

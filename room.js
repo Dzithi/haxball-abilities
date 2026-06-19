@@ -50,27 +50,64 @@ const stadiums = {
   await page.exposeFunction("dbGetBans", () => db.getBans());
   await page.exposeFunction("dbAddBan", (entry) => db.addBan(entry));
   await page.exposeFunction("dbClearBans", () => db.clearBans());
+  await page.exposeFunction("dbSaveFeedback", (entry) => {
+    const fs = require("fs");
+    const file = __dirname + "/data/feedback.json";
+    let arr = [];
+    try { arr = JSON.parse(fs.readFileSync(file, "utf8")); } catch(e) {}
+    arr.push(entry);
+    fs.writeFileSync(file, JSON.stringify(arr, null, 2));
+  });
+  await page.exposeFunction("dbGetFeedback", () => {
+    const fs = require("fs");
+    const file = __dirname + "/data/feedback.json";
+    try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch(e) { return []; }
+  });
+  await page.exposeFunction("dbResolveFeedback", (index) => {
+    const fs = require("fs");
+    const file = __dirname + "/data/feedback.json";
+    let arr = [];
+    try { arr = JSON.parse(fs.readFileSync(file, "utf8")); } catch(e) {}
+    const open = arr.filter(f => !f.resolved);
+    if (index < 0 || index >= open.length) return false;
+    open[index].resolved = true;
+    fs.writeFileSync(file, JSON.stringify(arr, null, 2));
+    return true;
+  });
 
   // WebSocket server for abilities
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 4200 });
+  let wsIdCounter = 0;
+  const wsIds = new Map(); // ws -> unique wsId
+  const wsById = new Map(); // wsId -> ws (for sending back)
   wss.on("listening", () => console.log("[WS] Ability server on 127.0.0.1:4200"));
   wss.on("error", (e) => console.log("[WS] Server error:", e.message));
   wss.on("connection", (ws) => {
+    const wsId = ++wsIdCounter;
+    wsIds.set(ws, wsId);
+    wsById.set(wsId, ws);
     ws.on("message", (raw) => {
       try {
         const data = JSON.parse(raw);
         if (data.type === "identify" && data.name) {
-          page.evaluate((name) => {
-            if (window.handleExtensionIdentify) window.handleExtensionIdentify(name);
-          }, data.name).catch(() => {});
+          page.evaluate((wsId, name) => {
+            if (window.handleExtensionIdentify) window.handleExtensionIdentify(wsId, name);
+          }, wsId, data.name).catch(() => {});
         }
-        if (data.type === "keydown" && data.name && data.slot) {
-          page.evaluate((name, slot) => {
-            if (window.handleAbility) window.handleAbility(name, slot);
-          }, data.name, data.slot).catch((e) => console.log("[WS] evaluate error:", e.message));
+        if (data.type === "keydown" && data.slot) {
+          page.evaluate((wsId, slot) => {
+            if (window.handleAbilityByWs) window.handleAbilityByWs(wsId, slot);
+          }, wsId, data.slot).catch((e) => console.log("[WS] evaluate error:", e.message));
         }
       } catch (e) {}
     });
+    ws.on("close", () => { wsIds.delete(ws); wsById.delete(wsId); });
+  });
+
+  // Expose function for room.js to send state updates to a specific player's extension
+  await page.exposeFunction("wsSendToPlayer", (wsId, data) => {
+    const ws = wsById.get(wsId);
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
   });
 
   await page.waitForFunction(() => typeof HBInit !== "undefined", { timeout: 15000 });
@@ -79,7 +116,7 @@ const stadiums = {
     // --- CONSTANTS ---
     var SCORE_LIMIT = 3;
     var TIME_LIMIT = 3;
-    var PRE_GAME_DELAY = 5000; // 5 seconds before fresh game start
+    var PRE_GAME_DELAY = 10000; // 10 seconds before fresh game start (allows character selection)
     var AFK_WARN_TIME = 4000; // 4 seconds before warning
     var AFK_KICK_TIME = 4000; // 4 more seconds before kick
     var PICK_TIMEOUT = 20000; // 20 seconds to pick
@@ -136,19 +173,31 @@ const stadiums = {
 
     // --- CHARACTERS ---
     var extensionVerified = {}; // playerId -> true
+    var wsToPlayer = {}; // wsId -> playerId
+    var playerToWs = {}; // playerId -> wsId
 
-    window.handleExtensionIdentify = function(name) {
+    window.handleExtensionIdentify = function(wsId, name) {
       var players = room.getPlayerList();
       for (var i = 0; i < players.length; i++) {
         if (players[i].name === name) {
           extensionVerified[players[i].id] = true;
-          break;
+          wsToPlayer[wsId] = players[i].id;
+          playerToWs[players[i].id] = wsId;
+          room.sendAnnouncement("✅ Extension connected!", players[i].id, 0x00FF00, "normal");
+          setTimeout(organize, 0);
+          return;
         }
       }
     };
 
+    window.handleAbilityByWs = function(wsId, slot) {
+      var pid = wsToPlayer[wsId];
+      if (!pid) return;
+      window.handleAbility(pid, slot);
+    };
+
     var CHARACTERS = {
-      bomber:    { name: "Bomber",    emoji: "🧨", color: 0xFF4444, slots: ["mine", "blast", "smoke"] },
+      bomber:    { name: "Bomber",    emoji: "🧨", color: 0xFF4444, slots: ["mine", "blast", "self_destruct"] },
       speedster: { name: "Speedster", emoji: "⚡", color: 0xFFFF00, slots: ["dash", "sprint", "phase"] },
       guardian:  { name: "Guardian",  emoji: "🛡️", color: 0x4488FF, slots: ["wall", "push", "fortress"] },
       frost:     { name: "Frost",     emoji: "🧊", color: 0x88DDFF, slots: ["ice_patch", "freeze_ray", "blizzard"] },
@@ -156,8 +205,22 @@ const stadiums = {
       trickster: { name: "Trickster", emoji: "👻", color: 0xCC66FF, slots: ["swap", "blink", "banish"] }
     };
     var playerCharacter = {};  // playerId -> character key
+    var ultCharge = {};        // playerId -> 0-100
     function getPlayerCharacter(pid) {
       return playerCharacter[pid] || "bomber";
+    }
+    function addUltCharge(pid, amount) {
+      if (!ultCharge[pid]) ultCharge[pid] = 0;
+      if (ultCharge[pid] >= 100) return;
+      ultCharge[pid] = Math.min(100, ultCharge[pid] + amount);
+      if (ultCharge[pid] >= 100) {
+        var p = room.getPlayer(pid);
+        if (p) {
+          var charKey = getPlayerCharacter(pid);
+          var c = CHARACTERS[charKey];
+          room.sendAnnouncement("⚡ " + p.name + "'s ULTIMATE is ready! [" + c.slots[2] + "]", null, c.color, "bold");
+        }
+      }
     }
 
     // --- STATE ---
@@ -177,6 +240,7 @@ const stadiums = {
     var matchStartTime = 0;
     var matchPlayers = []; // players present at kickoff
     var lastKicker = null; // last player who kicked the ball
+    var prevKicker = null; // second-to-last kicker (for assists)
     var gkTicks = {}; // playerId -> number of ticks as deepest player
     var lastBallPos = null;
     var ballSpeed = 0;
@@ -236,7 +300,7 @@ const stadiums = {
     var room = HBInit({
       roomName: "⚽ Futsal Ranked (Testing)",
       maxPlayers: 12,
-      public: true,
+      public: false,
       noPlayer: true,
       token: t,
     });
@@ -261,16 +325,19 @@ const stadiums = {
     function removeFromQueue(id) {
       queue = queue.filter(function (qid) { return qid !== id; });
     }
+    function isEligible(pid) {
+      return !afkPlayers[pid] && extensionVerified[pid];
+    }
     function firstAvailableInQueue() {
       for (var i = 0; i < queue.length; i++) {
-        if (!afkPlayers[queue[i]]) return queue[i];
+        if (isEligible(queue[i])) return queue[i];
       }
       return null;
     }
     function availableQueueCount() {
       var count = 0;
       for (var i = 0; i < queue.length; i++) {
-        if (!afkPlayers[queue[i]]) count++;
+        if (isEligible(queue[i])) count++;
       }
       return count;
     }
@@ -373,7 +440,7 @@ const stadiums = {
       var teamName = current.team === 1 ? "Red" : "Blue";
       var availQueue = [];
       for (var i = 0; i < queue.length; i++) {
-        if (!afkPlayers[queue[i]]) availQueue.push(queue[i]);
+        if (isEligible(queue[i])) availQueue.push(queue[i]);
       }
       if (availQueue.length === 0) { finishPicking(); return; }
       var msg2 = msg(current.captain, "pickPrompt", { team: teamName });
@@ -942,16 +1009,22 @@ const stadiums = {
       }
       room.sendAnnouncement("🌐 Type !en for English | Digite !pt para Português", player.id, 0x888888, "normal");
 
-      // Extension detection: wait 5s, if no identify received, warn player
+      // Extension detection: remind every 60s until verified
       var pid = player.id;
+      var extCheck = setInterval(function () {
+        if (extensionVerified[pid]) { clearInterval(extCheck); return; }
+        var pl = room.getPlayer(pid);
+        if (!pl) { clearInterval(extCheck); return; }
+        room.sendAnnouncement("⚠️ Extension required to play! Install it: github.com/Dzithi/haxball-abilities", pid, 0xFF4444, "bold");
+      }, 60000);
+      // Also warn after 5s initially
       setTimeout(function () {
         if (!extensionVerified[pid]) {
           var pl = room.getPlayer(pid);
-          if (pl) {
-            room.sendAnnouncement("⚠️ Extension not detected! Install it: github.com/Dzithi/haxball-abilities", pid, 0xFF4444, "bold");
-          }
+          if (pl) room.sendAnnouncement("⚠️ Extension required to play! Install it: github.com/Dzithi/haxball-abilities", pid, 0xFF4444, "bold");
         }
       }, 5000);
+
       addToQueue(player.id);
       recordActivity(player.id);
 
@@ -1200,6 +1273,47 @@ const stadiums = {
         return false;
       }
 
+      if (message.toLowerCase().startsWith("!feedback")) {
+        var text = message.substring(9).trim();
+        if (!text) {
+          room.sendAnnouncement("Usage: !feedback <your message>", player.id, 0x888888, "normal");
+          return false;
+        }
+        dbSaveFeedback({ name: player.name, auth: playerAuths[player.id], text: text, date: new Date().toISOString(), resolved: false });
+        room.sendAnnouncement("✅ Feedback saved! Thanks " + player.name, player.id, 0x00FF00, "normal");
+        return false;
+      }
+
+      if (message.toLowerCase() === "!showfeedback") {
+        if (!player.admin) { room.sendAnnouncement("Admin only.", player.id, 0xFF4444, "normal"); return false; }
+        dbGetFeedback().then(function(list) {
+          var open = list.filter(function(f) { return !f.resolved; });
+          if (open.length === 0) {
+            room.sendAnnouncement("📋 No open feedback.", player.id, 0x888888, "normal");
+            return;
+          }
+          for (var i = 0; i < open.length; i++) {
+            room.sendAnnouncement("#" + (i + 1) + " [" + open[i].name + "] " + open[i].text + " (" + open[i].date.substring(0, 10) + ")", player.id, 0x00FFFF, "normal");
+          }
+          room.sendAnnouncement("Use !resolve <number> to resolve", player.id, 0x888888, "normal");
+        });
+        return false;
+      }
+
+      if (message.toLowerCase().startsWith("!resolve")) {
+        if (!player.admin) { room.sendAnnouncement("Admin only.", player.id, 0xFF4444, "normal"); return false; }
+        var num = parseInt(message.substring(8).trim());
+        if (isNaN(num) || num < 1) {
+          room.sendAnnouncement("Usage: !resolve <number>", player.id, 0x888888, "normal");
+          return false;
+        }
+        dbResolveFeedback(num - 1).then(function(ok) {
+          if (ok) room.sendAnnouncement("✅ Feedback #" + num + " resolved.", player.id, 0x00FF00, "normal");
+          else room.sendAnnouncement("❌ Invalid number.", player.id, 0xFF4444, "normal");
+        });
+        return false;
+      }
+
       if (message.toLowerCase() === "!en") {
         playerLang[player.id] = "en";
         room.sendAnnouncement("🌐 Language set to English.", player.id, 0x888888, "normal");
@@ -1213,10 +1327,40 @@ const stadiums = {
       }
 
       if (message.toLowerCase() === "!help") {
-        room.sendAnnouncement(msg(player.id, "help1"), player.id, 0x00FFFF, "normal");
-        room.sendAnnouncement(msg(player.id, "help2"), player.id, 0x00FFFF, "normal");
-        room.sendAnnouncement(msg(player.id, "help3"), player.id, 0x00FFFF, "normal");
-        room.sendAnnouncement("⚡ !char <name> — Pick character: bomber, speedster, guardian, frost, striker, trickster", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("📋 COMMANDS:", player.id, 0x00FFFF, "bold");
+        room.sendAnnouncement("⚡ !char <name> — Pick character (bomber, speedster, guardian, frost, striker, trickster)", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("📖 !abilities <name> — See ability details for a character", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("📊 !stats — Your stats | !top — Top 5 | !streak — Win streaks", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("🔍 !rank <name> — Check any player's stats", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("📬 !feedback <msg> — Send feedback to admins", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("💤 !afk — Toggle AFK | 👋 !bb — Leave room", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("💬 t <msg> — Team chat | @@Name <msg> — Private message", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("🌐 !en — English | !pt — Português", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("👀 !queue — See queue | !char — See your character", player.id, 0x00FFFF, "normal");
+        room.sendAnnouncement("📖 !abilities — See your abilities", player.id, 0x00FFFF, "normal");
+        return false;
+      }
+
+      if (message.toLowerCase().startsWith("!abilities")) {
+        var parts = message.trim().split(/\s+/);
+        var target = parts.length > 1 ? parts[1].toLowerCase() : getPlayerCharacter(player.id);
+        var descs = {
+          bomber: ["1: Mine — Place explosive trap (team color, invisible after 1s). Enemies in range get blasted away. 10s cd", "2: Blast — Detonate ALL your mines at once. 20s cd", "3: Self-Destruct [ULT] — Explode yourself! 80u radius, massive knockback to enemies + ball. You're stunned 1s."],
+          speedster: ["1: Dash — Teleport 80u forward instantly. 8s cd", "2: Sprint — +50% speed for 3s. 15s cd", "3: Phase [ULT] — Become untouchable for 1.5s. Immune to everything."],
+          guardian: ["1: Wall — Place solid barrier for 4s. Blocks ball + players. 12s cd", "2: Push — Knockback all nearby enemies + ball. 15s cd", "3: Fortress [ULT] — 3-disc barricade in an arc. Lasts 3s."],
+          frost: ["1: Ice Patch — Drop slow zone (5s). Enemies get -50% speed. 10s cd", "2: Freeze Ray — Freeze nearest enemy for 2s. Must be close (40u). 18s cd", "3: Blizzard [ULT] — ALL enemies get -30% speed for 3s. Global."],
+          striker: ["1: Power Shot — Next kick gets +80% ball speed. 12s cd", "2: Pull — Yank ball to your position (within 100u). 20s cd", "3: Rocket [ULT] — Launch ball at opponent goal. Must be touching ball."],
+          trickster: ["1: Swap — Switch positions with nearest teammate. 12s cd", "2: Blink — Random teleport within 120u. 10s cd", "3: Banish [ULT] — Send nearest enemy to their own goal line."]
+        };
+        if (!descs[target]) {
+          room.sendAnnouncement("Unknown character. Options: " + Object.keys(CHARACTERS).join(", "), player.id, 0xFF4444, "normal");
+          return false;
+        }
+        var c = CHARACTERS[target];
+        room.sendAnnouncement(c.emoji + " " + c.name + " abilities:", player.id, c.color, "bold");
+        for (var i = 0; i < descs[target].length; i++) {
+          room.sendAnnouncement(descs[target][i], player.id, c.color, "normal");
+        }
         return false;
       }
 
@@ -1231,6 +1375,10 @@ const stadiums = {
         var choice = parts[1].toLowerCase();
         if (!CHARACTERS[choice]) {
           room.sendAnnouncement("Unknown character. Options: " + Object.keys(CHARACTERS).join(", "), player.id, 0xFF4444, "normal");
+          return false;
+        }
+        if (gameRunning && player.team !== 0) {
+          room.sendAnnouncement("⚠️ Can't switch characters during a game!", player.id, 0xFF4444, "normal");
           return false;
         }
         playerCharacter[player.id] = choice;
@@ -1385,7 +1533,7 @@ const stadiums = {
         var pickedId = null;
         var availQueue = [];
         for (var i = 0; i < queue.length; i++) {
-          if (!afkPlayers[queue[i]]) availQueue.push(queue[i]);
+          if (isEligible(queue[i])) availQueue.push(queue[i]);
         }
         if (availQueue.length === 0) { finishPicking(); return false; }
 
@@ -1464,7 +1612,10 @@ const stadiums = {
     };
 
     room.onPlayerBallKick = function (player) {
+      prevKicker = lastKicker;
       lastKicker = player;
+      // +5% ult charge on any kick
+      addUltCharge(player.id, 5);
       // Power shot buff
       if (buffs[player.id] && buffs[player.id].type === "power_shot") {
         var mult = buffs[player.id].multiplier;
@@ -1485,6 +1636,7 @@ const stadiums = {
       mine:       { cd: 10000 },
       blast:      { cd: 20000 },
       smoke:      { cd: 25000 },
+      self_destruct: { cd: 30000 },
       dash:       { cd: 8000 },
       sprint:     { cd: 15000 },
       phase:      { cd: 25000 },
@@ -1585,16 +1737,14 @@ const stadiums = {
       return nearest;
     }
 
-    window.handleAbility = function(name, slot) {
+    window.handleAbility = function(pid, slot) {
       if (!gameRunning) return;
       if (typeof slot !== "number" || slot < 1 || slot > 3) return;
 
-      var players = room.getPlayerList();
-      var p = null;
-      for (var i = 0; i < players.length; i++) {
-        if (players[i].name === name) { p = players[i]; break; }
-      }
+      var p = room.getPlayer(pid);
       if (!p || !p.position || p.team === 0) return;
+
+      var players = room.getPlayerList();
 
       var charKey = getPlayerCharacter(p.id);
       var char = CHARACTERS[charKey];
@@ -1602,8 +1752,16 @@ const stadiums = {
       if (!ability) return;
       if (isOnCooldown(p.id, ability)) return;
 
+      // Slot 3 = ultimate, requires full charge
+      if (slot === 3) {
+        if (!ultCharge[p.id] || ultCharge[p.id] < 100) return;
+      }
+
       var executed = executeAbility(ability, p, players);
-      if (executed) setCooldown(p.id, ability);
+      if (executed) {
+        setCooldown(p.id, ability);
+        if (slot === 3) ultCharge[p.id] = 0;
+      }
     };
 
     function executeAbility(ability, p, players) {
@@ -1618,13 +1776,14 @@ const stadiums = {
           var discIdx;
           if (slotIdx >= 0) {
             discIdx = mines[slotIdx].discIdx;
-            mines[slotIdx] = { x: p.position.x, y: p.position.y, placer: p.id, active: false, discIdx: discIdx, armTime: Date.now() + 1000 };
+            mines[slotIdx] = { x: p.position.x, y: p.position.y, placer: p.id, team: p.team, active: false, discIdx: discIdx, armTime: Date.now() + 1000 };
           } else {
             discIdx = mineDiscStarts[currentMap] + mineCount;
-            mines.push({ x: p.position.x, y: p.position.y, placer: p.id, active: false, discIdx: discIdx, armTime: Date.now() + 1000 });
+            mines.push({ x: p.position.x, y: p.position.y, placer: p.id, team: p.team, active: false, discIdx: discIdx, armTime: Date.now() + 1000 });
             mineCount++;
           }
-          try { room.setDiscProperties(discIdx, { x: p.position.x, y: p.position.y, radius: 5, invMass: 0, color: 0xFF0000, cMask: 0, cGroup: 0 }); } catch(e) {}
+          var mineColor = p.team === 1 ? 0xFF0000 : 0x0000FF;
+          try { room.setDiscProperties(discIdx, { x: p.position.x, y: p.position.y, radius: 5, invMass: 0, color: mineColor, cMask: 0, cGroup: 0 }); } catch(e) {}
           room.sendAnnouncement("💣 " + p.name + " placed a mine!", null, 0xFF4444, "normal");
           return true;
         }
@@ -1633,16 +1792,38 @@ const stadiums = {
           for (var i = 0; i < mines.length; i++) {
             if (mines[i].placer === p.id && mines[i].armTime !== Infinity) {
               mines[i].active = true; // force activate
-              // Check proximity NOW
+              // Check proximity NOW — explode
+              var BLAST_RADIUS = 50;
+              var MAX_FORCE = 12;
               for (var j = 0; j < players.length; j++) {
                 var pl = players[j];
-                if (!pl.position || pl.team === 0) continue;
-                if (distBetween(pl.position, mines[i]) < 30) {
-                  trapped[pl.id] = { x: mines[i].x, y: mines[i].y, until: Date.now() + 2000 };
+                if (!pl.position || pl.team === 0 || pl.team === p.team) continue;
+                if (phased[pl.id] && Date.now() < phased[pl.id]) continue;
+                var d = distBetween(pl.position, mines[i]);
+                if (d < BLAST_RADIUS) {
+                  var force = MAX_FORCE * (1 - d / BLAST_RADIUS);
+                  var dx = pl.position.x - mines[i].x;
+                  var dy = pl.position.y - mines[i].y;
+                  var mag = Math.sqrt(dx * dx + dy * dy) || 1;
+                  try { room.setPlayerDiscProperties(pl.id, { xspeed: (dx / mag) * force, yspeed: (dy / mag) * force }); } catch(e) {}
                   triggered++;
                 }
               }
               try { room.setDiscProperties(mines[i].discIdx, { x: 0, y: 9999, radius: 0 }); } catch(e) {}
+              // Push ball if nearby
+              try {
+                var ball = room.getDiscProperties(0);
+                if (ball) {
+                  var bd = distBetween(ball, mines[i]);
+                  if (bd < BLAST_RADIUS) {
+                    var bforce = MAX_FORCE * (1 - bd / BLAST_RADIUS);
+                    var bdx = ball.x - mines[i].x;
+                    var bdy = ball.y - mines[i].y;
+                    var bmag = Math.sqrt(bdx * bdx + bdy * bdy) || 1;
+                    room.setDiscProperties(0, { xspeed: ball.xspeed + (bdx / bmag) * bforce, yspeed: ball.yspeed + (bdy / bmag) * bforce });
+                  }
+                }
+              } catch(e) {}
               mines[i].active = false; mines[i].armTime = Infinity;
             }
           }
@@ -1656,6 +1837,41 @@ const stadiums = {
           try { room.setDiscProperties(idx, { x: p.position.x, y: p.position.y, radius: 18, invMass: 0, color: 0x888888, cMask: 1, cGroup: 1 }); } catch(e) {}
           walls.push({ discIdx: idx, until: Date.now() + 3000, type: "smoke" });
           room.sendAnnouncement("💨 " + p.name + " dropped smoke!", null, 0x888888, "normal");
+          return true;
+        }
+        case "self_destruct": {
+          var BLAST_RADIUS = 80;
+          var MAX_FORCE = 15;
+          for (var i = 0; i < players.length; i++) {
+            var target = players[i];
+            if (!target.position || target.team === 0 || target.team === p.team) continue;
+            if (phased[target.id] && Date.now() < phased[target.id]) continue;
+            var d = distBetween(target.position, p.position);
+            if (d < BLAST_RADIUS) {
+              var force = MAX_FORCE * (1 - d / BLAST_RADIUS);
+              var dx = target.position.x - p.position.x;
+              var dy = target.position.y - p.position.y;
+              var mag = Math.sqrt(dx * dx + dy * dy) || 1;
+              try { room.setPlayerDiscProperties(target.id, { xspeed: (dx / mag) * force, yspeed: (dy / mag) * force }); } catch(e) {}
+            }
+          }
+          // Push ball too
+          try {
+            var ball = room.getDiscProperties(0);
+            if (ball) {
+              var bd = distBetween(ball, p.position);
+              if (bd < BLAST_RADIUS) {
+                var bforce = MAX_FORCE * (1 - bd / BLAST_RADIUS);
+                var bdx = ball.x - p.position.x;
+                var bdy = ball.y - p.position.y;
+                var bmag = Math.sqrt(bdx * bdx + bdy * bdy) || 1;
+                room.setDiscProperties(0, { xspeed: ball.xspeed + (bdx / bmag) * bforce, yspeed: ball.yspeed + (bdy / bmag) * bforce });
+              }
+            }
+          } catch(e) {}
+          // Stun self for 1s
+          trapped[p.id] = { x: p.position.x, y: p.position.y, until: Date.now() + 1000 };
+          room.sendAnnouncement("💀 " + p.name + " SELF-DESTRUCTED!", null, 0xFF4444, "bold");
           return true;
         }
 
@@ -1737,8 +1953,8 @@ const stadiums = {
         case "ice_patch": {
           var idx = getNextWallDisc();
           if (idx === -1) return false;
-          try { room.setDiscProperties(idx, { x: p.position.x, y: p.position.y, radius: 25, invMass: 0, color: 0x88DDFF, cMask: 0, cGroup: 0 }); } catch(e) {}
-          slowZones.push({ x: p.position.x, y: p.position.y, until: Date.now() + 5000, discIdx: idx, radius: 25 });
+          try { room.setDiscProperties(idx, { x: p.position.x, y: p.position.y, radius: 6, invMass: 0, color: 0x88DDFF, cMask: 0, cGroup: 0 }); } catch(e) {}
+          slowZones.push({ x: p.position.x, y: p.position.y, until: Date.now() + 5000, discIdx: idx, radius: 25, team: p.team });
           walls.push({ discIdx: idx, until: Date.now() + 5000, type: "ice" });
           room.sendAnnouncement("🧊 " + p.name + " placed ice!", null, 0x88DDFF, "normal");
           return true;
@@ -1746,7 +1962,7 @@ const stadiums = {
         case "freeze_ray": {
           var enemy = getNearestEnemy(p, players, 40);
           if (!enemy) return false;
-          trapped[enemy.id] = { x: enemy.position.x, y: enemy.position.y, until: Date.now() + 1000 };
+          trapped[enemy.id] = { x: enemy.position.x, y: enemy.position.y, until: Date.now() + 2000 };
           room.sendAnnouncement("❄️ " + p.name + " froze " + enemy.name + "!", null, 0x88DDFF, "bold");
           return true;
         }
@@ -1833,18 +2049,83 @@ const stadiums = {
 
       var allP = room.getPlayerList();
 
+      // --- Passive ult charge: +2% every 5s for players on field ---
+      if (!this._ultTick) this._ultTick = 0;
+      this._ultTick++;
+      if (this._ultTick >= 300) { // 60fps * 5s
+        this._ultTick = 0;
+        for (var i = 0; i < allP.length; i++) {
+          if (allP[i].team !== 0) addUltCharge(allP[i].id, 2);
+        }
+      }
+
+      // --- Send HUD state to extensions every 0.5s ---
+      if (!this._hudTick) this._hudTick = 0;
+      this._hudTick++;
+      if (this._hudTick >= 30) {
+        this._hudTick = 0;
+        for (var i = 0; i < allP.length; i++) {
+          var pid = allP[i].id;
+          var wsId = playerToWs[pid];
+          if (!wsId) continue;
+          var charKey = getPlayerCharacter(pid);
+          var char = CHARACTERS[charKey];
+          var now = Date.now();
+          var cd1 = cooldowns[pid] && cooldowns[pid][char.slots[0]] ? Math.max(0, cooldowns[pid][char.slots[0]] - now) : 0;
+          var cd2 = cooldowns[pid] && cooldowns[pid][char.slots[1]] ? Math.max(0, cooldowns[pid][char.slots[1]] - now) : 0;
+          var charge = ultCharge[pid] || 0;
+          wsSendToPlayer(wsId, { type: "hud", slots: [
+            { name: char.slots[0], cd: Math.ceil(cd1 / 1000) },
+            { name: char.slots[1], cd: Math.ceil(cd2 / 1000) },
+            { name: char.slots[2], charge: charge }
+          ]});
+        }
+      }
+
       // --- Mine detection ---
       for (var m = 0; m < mines.length; m++) {
         var mine = mines[m];
-        if (!mine.active && mine.armTime !== Infinity && Date.now() >= mine.armTime) mine.active = true;
+        if (!mine.active && mine.armTime !== Infinity && Date.now() >= mine.armTime) {
+          mine.active = true;
+          try { room.setDiscProperties(mine.discIdx, { radius: 0 }); } catch(e) {}
+        }
         if (!mine.active) continue;
         for (var i = 0; i < allP.length; i++) {
           var pl = allP[i];
-          if (!pl.position || pl.team === 0) continue;
+          if (!pl.position || pl.team === 0 || pl.team === mine.team) continue;
           if (phased[pl.id] && Date.now() < phased[pl.id]) continue;
           if (distBetween(pl.position, mine) < 20) {
-            trapped[pl.id] = { x: mine.x, y: mine.y, until: Date.now() + 2000 };
-            room.sendAnnouncement("💥 " + pl.name + " stepped on a mine!", null, 0xFF0000, "bold");
+            // Explode! Push all enemies in blast radius
+            var BLAST_RADIUS = 50;
+            var MAX_FORCE = 12;
+            for (var j = 0; j < allP.length; j++) {
+              var target = allP[j];
+              if (!target.position || target.team === 0 || target.team === mine.team) continue;
+              if (phased[target.id] && Date.now() < phased[target.id]) continue;
+              var d = distBetween(target.position, mine);
+              if (d < BLAST_RADIUS) {
+                var force = MAX_FORCE * (1 - d / BLAST_RADIUS);
+                var dx = target.position.x - mine.x;
+                var dy = target.position.y - mine.y;
+                var mag = Math.sqrt(dx * dx + dy * dy) || 1;
+                try { room.setPlayerDiscProperties(target.id, { xspeed: (dx / mag) * force, yspeed: (dy / mag) * force }); } catch(e) {}
+              }
+            }
+            room.sendAnnouncement("💥 Mine exploded!", null, 0xFF0000, "bold");
+            // Push ball if nearby
+            try {
+              var ball = room.getDiscProperties(0);
+              if (ball) {
+                var bd = distBetween(ball, mine);
+                if (bd < BLAST_RADIUS) {
+                  var bforce = MAX_FORCE * (1 - bd / BLAST_RADIUS);
+                  var bdx = ball.x - mine.x;
+                  var bdy = ball.y - mine.y;
+                  var bmag = Math.sqrt(bdx * bdx + bdy * bdy) || 1;
+                  room.setDiscProperties(0, { xspeed: ball.xspeed + (bdx / bmag) * bforce, yspeed: ball.yspeed + (bdy / bmag) * bforce });
+                }
+              }
+            } catch(e) {}
             try { room.setDiscProperties(mine.discIdx, { x: 0, y: 9999, radius: 0 }); } catch(e) {}
             mine.active = false; mine.armTime = Infinity;
             break;
@@ -1857,7 +2138,7 @@ const stadiums = {
         if (Date.now() > slowZones[z].until) { slowZones.splice(z, 1); continue; }
         for (var i = 0; i < allP.length; i++) {
           var pl = allP[i];
-          if (!pl.position || pl.team === 0) continue;
+          if (!pl.position || pl.team === 0 || pl.team === slowZones[z].team) continue;
           if (phased[pl.id] && Date.now() < phased[pl.id]) continue;
           if (distBetween(pl.position, slowZones[z]) < slowZones[z].radius) {
             if (!buffs[pl.id] || buffs[pl.id].type !== "slow") {
@@ -1950,6 +2231,12 @@ const stadiums = {
     room.onTeamGoal = function (team) {
       var speedStr = ballSpeed > 0 ? " | " + ballSpeed.toFixed(1) + " km/h" : "";
       if (lastKicker && lastKicker.team === team) {
+        // +50% ult charge for scorer
+        addUltCharge(lastKicker.id, 50);
+        // +30% ult charge for assist (prev kicker, same team, different player)
+        if (prevKicker && prevKicker.team === team && prevKicker.id !== lastKicker.id) {
+          addUltCharge(prevKicker.id, 30);
+        }
         var auth = playerAuths[lastKicker.id];
         if (auth) {
           dbGetPlayer(auth).then(function (p) {
@@ -1989,6 +2276,8 @@ const stadiums = {
       matchStartTime = Date.now();
       matchPlayers = redTeam.concat(blueTeam);
       gkTicks = {};
+      // Reset ult charge for all players
+      for (var i = 0; i < matchPlayers.length; i++) { ultCharge[matchPlayers[i]] = 0; }
       lastBallPos = null;
       ballSpeed = 0;
       mines = [];

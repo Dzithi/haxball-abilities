@@ -7,6 +7,17 @@ function connect() {
   ws.onopen = () => console.log("[HaxAbility BG] Connected");
   ws.onclose = () => setTimeout(connect, 3000);
   ws.onerror = () => {};
+  ws.onmessage = (event) => {
+    // Forward server messages to content script
+    try {
+      const data = JSON.parse(event.data);
+      browser.tabs.query({ url: ["*://www.haxball.com/*", "*://html5.haxball.com/*"] }).then((tabs) => {
+        for (const tab of tabs) {
+          browser.tabs.sendMessage(tab.id, data).catch(() => {});
+        }
+      });
+    } catch(e) {}
+  };
 }
 
 browser.runtime.onMessage.addListener((msg) => {

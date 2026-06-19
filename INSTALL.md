@@ -2,14 +2,14 @@
 
 ## Firefox
 
-1. Download the extension: [haxball-abilities.xpi](https://github.com/shashuke/haxball-abilities/releases/latest/download/haxball-abilities.xpi)
+1. Download the extension: [haxball-abilities.xpi](https://github.com/Dzithi/haxball-abilities/releases/latest/download/haxball-abilities.xpi)
 2. Open the file — Firefox will ask to install it
 3. Click **Add**
 4. Done! The ⚡ icon appears in your toolbar
 
 ## Chrome / Edge / Brave
 
-1. Download and unzip: [haxball-abilities-chrome.zip](https://github.com/shashuke/haxball-abilities/releases/latest/download/haxball-abilities-chrome.zip)
+1. Download and unzip: [haxball-abilities-chrome.zip](https://github.com/Dzithi/haxball-abilities/releases/latest/download/haxball-abilities-chrome.zip)
 2. Open `chrome://extensions/` (or `edge://extensions/` / `brave://extensions/`)
 3. Enable **Developer mode** (toggle top-right)
 4. Click **Load unpacked**

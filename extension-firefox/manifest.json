@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "Haxball Abilities",
+  "version": "2.0",
+  "description": "Sends key presses to the Haxball room server",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "haxball-abilities@shashuke",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": ["*://localhost/*", "*://127.0.0.1/*", "storage"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "Haxball Abilities"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://www.haxball.com/*", "*://html5.haxball.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

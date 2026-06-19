@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Haxball Abilities",
+  "version": "2.0",
+  "description": "Sends key presses to the Haxball room server",
+  "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Haxball Abilities"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.haxball.com/*", "*://html5.haxball.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
